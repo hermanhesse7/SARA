@@ -1,0 +1,12 @@
+accelerate
+appdirs
+bitsandbytes
+black
+black[jupyter]
+datasets
+fire
+transformers
+gradio
+scipy
+sentencepiece
+protobuf
