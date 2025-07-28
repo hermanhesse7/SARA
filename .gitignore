@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+
+# Environment
+.env
+.venv
+env/
+venv/
+*.egg-info/
+
+# VS Code settings
+.vscode/
+
+# Dataset and model outputs (optional)
+*.json
+*.log
+*.ckpt
+*.pt
+
+# PyTorch Lightning cache
+lightning_logs/
+
+# General OS files
+.DS_Store
