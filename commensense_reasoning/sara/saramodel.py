@@ -69,7 +69,7 @@ def _kaiming_init(
         return tensor.uniform_(-bound, bound, generator=generator)
 
 
-class SARAModel(BaseTuner):
+class SARAModel(torch.nn.Module):
     """
     Creates Single Head Attention based Random Matrix Adaptation (SARA) model from a pretrained transformers model.
 
@@ -101,8 +101,13 @@ class SARAModel(BaseTuner):
 
     prefix: str = "sara_attn_"
 
-    def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False) -> None:
-        super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
+    def __init__(self, config, model):
+        super.__init__()
+        self.peft_config = config
+        self.model = model
+        self._find_and_replace()
+        self.forward = self.model.forward
+      
 
     def _find_dim(self, config) -> tuple[int, int]:
         """
