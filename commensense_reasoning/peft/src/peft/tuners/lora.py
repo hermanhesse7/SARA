@@ -653,9 +653,7 @@ class LoraLayer:
                     _lora_A.weight.data = self.custom["shared_matrices"]["A"].weight.data[:r, : self.in_features]
                     _lora_B.weight.data = self.custom["shared_matrices"]["B"].weight.data[: self.out_features, :r]
             self.lora_A.update(nn.ModuleDict({adapter_name: _lora_A}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B})
-
-
+            self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))
 
             if self.custom["mode"] != "lora":
                 if not self.custom["trainable_uv"]:
@@ -1540,14 +1538,3 @@ if is_bnb_available():
                         else:
                             raise NotImplementedError()
                 return result
-
-
-        super().__init__()
-        self.peft_config = {adapter_name: config}  # Store config in dict like BaseTuner
-        self.model = model
-        self.active_adapter = adapter_name
-
-        
-        # Initialize the SARA components
-        self._init_sara_A_sara_B(config, adapter_name)
-        self._find_and_replace(adapter_name)  
