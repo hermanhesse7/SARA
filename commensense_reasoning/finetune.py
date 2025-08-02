@@ -12,7 +12,7 @@ from transformers import (
 )
 import argparse
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from peft.tuners.lora import LoraLayer
+from peft.src.peft.tuners.sara import LoraLayer
 import wandb
 from utils import (
     load_data,

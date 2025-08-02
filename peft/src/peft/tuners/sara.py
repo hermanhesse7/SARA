@@ -561,10 +561,6 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
 
 
 class LoraLayer:
-    # List all names of layers that may contain adapter weights
-    adapter_layer_names = ("sara_attn_lambda", "sara_attn_Wqkv, sara_attn_Wo")
-    other_param_names = ("sara_A", "sara_B")
-
     def __init__(self, in_features: int, out_features: int, fan_in_fan_out: bool, custom, **kwargs):
         self.r = {}
         self.lora_alpha = {}
@@ -613,7 +609,7 @@ class LoraLayer:
 
     def update_layer(self, adapter_name, r, lora_c, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
-        self.c[adapter_name] = lora_c
+        self.lora_c[adapter_name] = lora_c 
         self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -676,13 +672,13 @@ class LoraLayer:
             self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))
 
             if self.custom["mode"] == "sara":
+                assert lora_c > 0, "lora_c must be positive"
+                assert r % lora_c == 0, "r must be divisible by lora_c"
 
-                if lora_c < r and r % lora_c == 0:
+                head_dim = (r // lora_c)
 
-                    head_dim = (r // lora_c)
-
-                    lora_attention_Wqkv = nn.Linear(r, head_dim * 3, bias=False)
-                    lora_attention_Wo = nn.Linear(head_dim, r, bias=False)
+                lora_attention_Wqkv = nn.Linear(r, head_dim * 3, bias=False)
+                lora_attention_Wo = nn.Linear(head_dim, r, bias=False)
 
                 self.lora_attn_Wqkv.update(nn.ModuleDict({adapter_name: lora_attention_Wqkv}))
                 self.lora_attn_Wo.update(nn.ModuleDict({adapter_name: lora_attention_Wo}))
@@ -1244,28 +1240,26 @@ class Linear(nn.Linear, LoraLayer):
 
                 num_heads = 1
 
+                # Project through LoRA
                 lora_out = self.lora_A[self.active_adapter](x)
 
-                x = self.lora_attn_Wqkv[self.active_adapter](lora_out).reshape(B, S, 3, num_heads, C // self.lora_c[self.active_adapter])
+                # Attention projections
+                qkv = self.lora_attn_Wqkv[self.active_adapter](lora_out).reshape(B, S, 3, num_heads, C // self.lora_c[self.active_adapter])
+                q, k, v = qkv.transpose(3, 1).unbind(dim=2)
 
-                q, k, v = x.transpose(3, 1).unbind(dim=2)
-        
-                attn_output = q @ k.transpose(-2, -1)
+                # Attention scores        
+                attn = q @ k.transpose(-2, -1)
+                attn = attn / math.sqrt(k.size(-1))
+                attn = attn.softmax(dim=-1)
 
-                attn_output = attn_output / math.sqrt(k.size(-1))
-
-                attn_output = attn_output.softmax(dim=-1)
-
-                attn_output = attn_output @ v
-
+                # Attention output
+                attn_output = attn @ v
                 attn_output = attn_output.transpose(1, 2).reshape(B, S, C // self.lora_c[self.active_adapter])
-
                 attn_output = self.lora_attn_Wo[self.active_adapter](attn_output)
 
+                # Final projection and scaling
                 up_project_out = self.lora_B[self.active_adapter](attn_output)
-
                 output = up_project_out * self.lora_db[self.active_adapter]
-
                 output = output * self.scaling[self.active_adapter] 
 
                 result += output
