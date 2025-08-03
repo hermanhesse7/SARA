@@ -1,5 +1,8 @@
 import os
+import sys
 import torch
+import csv
+import time
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
@@ -13,7 +16,6 @@ from transformers import (
 import argparse
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from peft.src.peft.tuners.sara import LoraLayer
-import wandb
 from utils import (
     load_data,
     format_dataset,
@@ -24,34 +26,34 @@ from utils import (
     generate_samples,
     preprocess_logits_for_metrics,
     compute_metrics,
-    MetricEvalCallback,
-    GradientLogCallback,
     find_all_linear_names,
 )
-import time
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+def log_metrics_to_csv(metrics, filename, fieldnames=None):
+    file_exists = os.path.isfile(filename)
+    with open(filename, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames or list(metrics.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(metrics)
 
 def run(args):
     job_id = os.environ.get("SLURM_JOB_ID", "0")
-    run_id = wandb.util.generate_id()
-
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    
     set_seed(args.seed)
 
-    wandb.init(
-        id=run_id,
-        name=None if args.run_name is None else args.run_name,
-        group=None if args.run_group is None else args.run_group,
-        project=args.run_project,
-        mode="offline" if args.offline else "online",
-    )
-    wandb.config.update({"seed_val": args.seed})
-    wandb.config.update(dict(args._get_kwargs()))
-    wandb.config.update({"job_id": job_id, "init_job_id": args.init_job_id})
+    # Log configuration to CSV
+    config_file = os.path.join(output_dir, "config.csv")
+    config_data = {"job_id": job_id, "timestamp": timestamp, **vars(args)}
+    log_metrics_to_csv(config_data, config_file)
 
     print(f"Job ID: {job_id}")
-    print(f"Run ID: {run_id}")
+    print(f"Output directory: {output_dir}")
 
     imdb = load_dataset("imdb")
 
@@ -63,7 +65,7 @@ def run(args):
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token = tokenizer.eos_token
 
-    # asserts for tokenizer
+    # Tokenizer asserts remain unchanged
     assert (
         tokenizer("### Response:", add_special_tokens=False)["input_ids"]
         + tokenizer(
@@ -78,6 +80,7 @@ def run(args):
         + tokenizer("test", add_special_tokens=False)["input_ids"]
     )
 
+    # Dataset functions remain unchanged
     def _imdb_to_alpaca(examples, _instruction, answers, cut_off=1000):
         instruction = []
         input = []
@@ -221,10 +224,8 @@ def run(args):
                         if module.weight.dtype == torch.float32:
                             module = module.to(torch.bfloat16)
 
-    # print(model)
-
     training_args = TrainingArguments(
-        output_dir="training_output",
+        output_dir=output_dir,
         optim="adamw_torch",
         remove_unused_columns=False,
         learning_rate=args.lr,
@@ -237,7 +238,7 @@ def run(args):
         save_strategy="no",
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
-        report_to="wandb",
+        report_to="csv",  # Enable built-in CSV logging
         gradient_accumulation_steps=args.accumulation_steps,
         bf16=args.quantize,
         warmup_ratio=args.warmup_ratio,
@@ -252,17 +253,8 @@ def run(args):
         predict_with_generate=False,
     )
 
+    # Remove wandb-related callbacks
     callbacks = []
-
-    if args.metrics_enabled:
-        metric_ds = train_ds.select(range(args.metric_samples))
-        metricEvalCallback = MetricEvalCallback(
-            metric_ds, tokenizer, model, args.metric_bs
-        )
-        callbacks.append(metricEvalCallback)
-
-    gradientLogCallback = GradientLogCallback(model=model)
-    callbacks.append(gradientLogCallback)
 
     trainer = Trainer(
         model=model,
@@ -281,44 +273,39 @@ def run(args):
 
     print(f"Trainable parameters: {params_trainable}")
     print(f"Total number of parameters: {params_total}")
-    wandb.config.update(
-        {"params_trainable": params_trainable, "params_total": params_total}
+    
+    # Log parameters to CSV
+    params_file = os.path.join(output_dir, "parameters.csv")
+    log_metrics_to_csv(
+        {"params_trainable": params_trainable, "params_total": params_total},
+        params_file
     )
-    wandb.log({"params_trainable": params_trainable, "params_total": params_total})
-
-    # with torch.autocast("cuda"):
-    #     model.eval()
-    #     with torch.no_grad():
-    #         start = time.time()
-    #         for n in ds_names:
-    #             res = trainer.evaluate(eval_ds[n], metric_key_prefix=f"eval_{n}")
-    #             print(f"eval {n}:", res)
-    #         print(f"eval took {time.time() - start} seconds")
-    #         if args.generate_samples:
-    #             to_eval = [data_collator(eval_ds[n].select([0])) for n in ds_names]
-    #             to_eval += [data_collator(train_ds.select([0]))]
-    #             samples_before = generate_samples(model, tokenizer, to_eval)
 
     model.train()
     trainer.train()
 
-    with torch.autocast("cuda"):
-        model.eval()
-        with torch.no_grad():
-            start = time.time()
-            for n in ds_names:
-                res = trainer.evaluate(eval_ds[n], metric_key_prefix=f"eval_{n}")
-                print(f"final eval {n}:", res)
-            print(f"final eval took {time.time() - start} seconds")
-            if args.generate_samples:
-                samples_after = generate_samples(model, tokenizer, [], model_id=job_id)
-                # samples_after = generate_samples(model, tokenizer, to_eval)
-                data = []
-                for i in range(len(samples_after)):
-                    data.append(["", samples_after[i]])
-                wandb.log(
-                    {"generations": wandb.Table(data=data, columns=["before", "after"])}
-                )
+    # Final evaluation and logging
+    eval_results_file = os.path.join(output_dir, "final_evaluation.csv")
+    with torch.no_grad():
+        for name in ds_names:
+            res = trainer.evaluate(eval_ds[name], metric_key_prefix=f"eval_{name}")
+            print(f"final eval {name}:", res)
+            # Log each evaluation result
+            log_metrics_to_csv(
+                {"dataset": name, **res},
+                eval_results_file,
+                fieldnames=["dataset"] + list(res.keys())
+            )
+
+        if args.generate_samples:
+            samples = generate_samples(model, tokenizer, [], model_id=job_id)
+            samples_file = os.path.join(output_dir, "generated_samples.txt")
+            with open(samples_file, 'w') as f:
+                f.write("Generated Samples:\n")
+                f.write("="*50 + "\n")
+                for i, sample in enumerate(samples):
+                    f.write(f"Sample {i+1}:\n{sample}\n")
+                    f.write("="*50 + "\n")
 
 
 if __name__ == "__main__":
@@ -327,7 +314,7 @@ if __name__ == "__main__":
         "--custom_mode",
         type=str,
         default="full",
-        choices=["full", "lora", "only_b", "only_d", "elora"],
+        choices=["full", "lora", "only_b", "only_d", "elora", "sara"],
         help="mode of finetuning",
     )
     parser.add_argument(
@@ -348,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--d_init_type", type=int, default=0)
 
     parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_c", type=int, default=1)
     parser.add_argument("--lora_alpha", type=int, default=1)
     parser.add_argument("--target_modules", type=str, default="lm_head")
 
@@ -376,11 +364,9 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear")
 
-    parser.add_argument("--run_project", type=str, default="default")
-    parser.add_argument("--run_name", type=str, default="default")
-    parser.add_argument("--run_group", type=str, default="default")
-    parser.add_argument("--init_job_id", type=str, default=0)
-    parser.add_argument("--offline", action="store_true")
+    # New argument for output directory
+    parser.add_argument("--output_dir", type=str, default="training_output")
+    
     args = parser.parse_args()
 
     print("======= args =======")
