@@ -24,5 +24,4 @@ python finetune.py \
     --epochs 1 \
     --dynamic_uv 1 \
     --shared_dim 11008 \
-    --shared_uv 1 \
-    --offline
+    --shared_uv 1

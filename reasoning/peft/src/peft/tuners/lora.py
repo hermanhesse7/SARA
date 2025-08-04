@@ -1,17 +1,3 @@
-# coding=utf-8
-# Copyright 2023-present the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import os
 import math
 import re
@@ -36,7 +22,6 @@ from ..utils import (
     _get_submodules,
     transpose,
 )
-
 
 if is_bnb_available():
     import bitsandbytes as bnb
@@ -80,6 +65,9 @@ class LoraConfig(PeftConfig):
         },
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
+
+    lora_c: int = field(default=4, metadeta={"help": "Determine head dimension in sara method"})
+
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
         default=False,
@@ -113,6 +101,7 @@ class LoraConfig(PeftConfig):
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
+
 
 
 class LoraModel(torch.nn.Module):
@@ -575,13 +564,13 @@ class LoraLayer:
     def __init__(self, in_features: int, out_features: int, fan_in_fan_out: bool, custom, **kwargs):
         self.r = {}
         self.lora_alpha = {}
+        self.lora_c = {}
         self.scaling = {}
         self.lora_dropout = nn.ModuleDict({})
+
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
-        self.lora_d = nn.ParameterDict({})
-        self.lora_da = nn.ParameterDict({})
-        self.lora_db = nn.ParameterDict({})
+
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -594,8 +583,33 @@ class LoraLayer:
         self.fan_in_fan_out = fan_in_fan_out
         self.custom = custom
 
-    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+        if self.custom["mode"] == "elora":
+            self.lora_d = nn.ParameterDict({})
+            self.lora_db = nn.ParameterDict({})
+
+        elif self.custom["mode"] == "sara":
+            self.lora_attn_Wqkv = nn.ModuleDict({})
+            self.lora_attn_Wo = nn.ModuleDict({})
+            self.lora_db = nn.ParameterDict({})           
+        
+
+    @staticmethod
+    def _kaiming_init(tensor: torch.Tensor):
+        fan = nn.init._calculate_correct_fan(tensor, mode="fan_in")
+        gain = math.sqrt(2.0)
+        std = gain / math.sqrt(fan)
+        bound = math.sqrt(3.0) * std
+        with torch.no_grad():
+            return tensor.uniform_(-bound, bound)
+        
+
+    @property
+    def merged(self) -> bool:
+        return bool(self.merged_adapters)
+
+    def update_layer(self, adapter_name, r, lora_c, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
+        self.lora_c[adapter_name] = lora_c 
         self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -604,6 +618,7 @@ class LoraLayer:
             lora_dropout_layer = nn.Identity()
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
+
         # Actual trainable parameters
         if r > 0:
             if self.custom["shared_dim"] is None:
@@ -652,13 +667,30 @@ class LoraLayer:
                     )
                     _lora_A.weight.data = self.custom["shared_matrices"]["A"].weight.data[:r, : self.in_features]
                     _lora_B.weight.data = self.custom["shared_matrices"]["B"].weight.data[: self.out_features, :r]
+
             self.lora_A.update(nn.ModuleDict({adapter_name: _lora_A}))
             self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))
 
+            if self.custom["mode"] == "sara":
+                assert lora_c > 0, "lora_c must be positive"
+                assert r % lora_c == 0, "r must be divisible by lora_c"
+
+                head_dim = (r // lora_c)
+
+                lora_attention_Wqkv = nn.Linear(r, head_dim * 3, bias=False)
+                lora_attention_Wo = nn.Linear(head_dim, r, bias=False)
+
+                self.lora_attn_Wqkv.update(nn.ModuleDict({adapter_name: lora_attention_Wqkv}))
+                self.lora_attn_Wo.update(nn.ModuleDict({adapter_name: lora_attention_Wo}))
+
+
             if self.custom["mode"] != "lora":
+
                 if not self.custom["trainable_uv"]:
+
                     self.lora_A.requires_grad_(False)
                     self.lora_B.requires_grad_(False)
+
                 if self.custom["d_init_type"] == 0:
 
                     def d_init_fn(dim, component="d"):
@@ -834,9 +866,40 @@ class LoraLayer:
                             return torch.zeros(
                                 dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
                             )
+                        
+                elif self.custom["d_init_type"] == 100:
+                    def d_init_fn(dim, component="b"):
+                        if isinstance(dim, int):
+                            dim = (dim,)    
+                        return torch.zeros(
+                            dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
+                        )
+
+                elif self.custom["d_init_type"] == 101:
+                    def d_init_fn(dim, component="b"):
+                        if isinstance(dim, int):
+                            dim = (dim,)
+                        return torch.full(
+                            dim, 1e-3, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
+                        )
+                    
+                elif self.custom["d_init_type"] == 102:
+                    def d_init_fn(dim, component="b"):
+                        if isinstance(dim, int):
+                            dim = (dim,)
+                        return torch.full(
+                            dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
+                        )
+
+                elif self.custom["d_init_type"] == 103:
+                    def d_init_fn(dim, component="b"):
+                        if isinstance(dim, int):
+                            dim = (dim,)
+                        return torch.ones(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
 
                 else:
                     raise NotImplementedError()
+
 
                 if self.custom["shared_d"]:
                     if self.custom["shared_d_vector"] is None:
@@ -847,25 +910,37 @@ class LoraLayer:
                 else:
                     _lora_d = nn.Parameter(d_init_fn(r, "d"))
 
-                if self.custom["mode"] == "elora":
-                    self.lora_db.update(
-                        nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))})
-                    )
+                if self.custom["mode"] == "sara":
+
+                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))                    
+                    self.lora_db.requires_grad_(True)
+
+
+                elif self.custom["mode"] == "elora":
+
+                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))                    
                     self.lora_db.requires_grad_(True)
                     self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
                     self.lora_d.requires_grad_(True)
+
                 elif self.custom["mode"] == "only_b":
-                    self.lora_db.update(
-                        nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))})
-                    )
+
+                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))
                     self.lora_db.requires_grad_(True)
+
                 elif self.custom["mode"] == "only_d":
+
                     self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
                     self.lora_d.requires_grad_(True)
+
             if self.custom["submode"] == "lora_half" or self.custom["submode"] == "lora_half_svd":
+
                 self.lora_A.requires_grad_(False)
+
         if init_lora_weights:
+
             self.reset_lora_parameters(adapter_name)
+
         self.to(self.weight.device)
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
@@ -934,6 +1009,45 @@ class LoraLayer:
                     self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
                     self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
             else:
+
+                if self.custom["mode"] == "sara":
+                        if self.custom["submode"] == "lora_half_svd" or self.custom["submode"] == "lora_svd":
+                            U, s, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
+                            U = torch.mm(U, torch.diag(s))
+                            self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
+                            self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
+
+                        else:
+                            if self.custom["init_type"] == 0:
+                                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
+                                nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(sqrt_a))
+                            elif self.custom["init_type"] == 1:
+                                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight)
+                                nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight)
+                            elif self.custom["init_type"] == 2:
+                                nn.init.xavier_uniform_(self.lora_A[adapter_name].weight)
+                                nn.init.xavier_uniform_(self.lora_B[adapter_name].weight)
+                            elif self.custom["init_type"] == 3:
+                                nn.init.kaiming_normal_(self.lora_A[adapter_name].weight)
+                                nn.init.kaiming_normal_(self.lora_B[adapter_name].weight)
+                            elif self.custom["init_type"] == 4:
+                                nn.init.xavier_normal_(self.lora_A[adapter_name].weight)
+                                nn.init.xavier_normal_(self.lora_B[adapter_name].weight)
+                            elif self.custom["init_type"] == 5:
+                                nn.init.trunc_normal_(self.lora_A[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
+                                nn.init.trunc_normal_(self.lora_B[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
+                            elif self.custom["init_type"] == 6:
+                                nn.init.uniform_(self.lora_A[adapter_name].weight, a=0.0, b=0.1)
+                                nn.init.uniform_(self.lora_B[adapter_name].weight, a=0.0, b=0.1)
+                            elif self.custom["init_type"] == 7:
+                                self._kaiming_init(self.lora_A[adapter_name].weight)
+                                self._kaiming_init(self.lora_B[adapter_name].weight)  
+                            elif self.custom["init_type"] == 10:
+                                nn.init.normal_(self.lora_A[adapter_name].weight)
+                                nn.init.normal_(self.lora_B[adapter_name].weight)
+                                self.lora_A[adapter_name].weight.data *= self.scaling[adapter_name]
+
+
                 if (
                     self.custom["mode"] == "only_d"
                     or self.custom["mode"] == "elora"
@@ -960,6 +1074,9 @@ class LoraLayer:
                     elif self.custom["init_type"] == 6:
                         nn.init.uniform_(self.lora_A[adapter_name].weight, a=0.0, b=0.1)
                         nn.init.uniform_(self.lora_B[adapter_name].weight, a=0.0, b=0.1)
+                    elif self.custom["init_type"] == 7:
+                        self._kaiming_init(self.lora_A[adapter_name].weight)
+                        self._kaiming_init(self.lora_B[adapter_name].weight)  
                     elif self.custom["init_type"] == 10:
                         nn.init.normal_(self.lora_A[adapter_name].weight)
                         nn.init.normal_(self.lora_B[adapter_name].weight)
@@ -977,6 +1094,8 @@ class LoraLayer:
                     if self.custom["mode"] == "elora":
                         self._db = self.lora_db[adapter_name].data.clone().to(get_device())
                         self._d = self.lora_d[adapter_name].data.clone().to(get_device())
+                    elif self.custom["mode"] == "sara":
+                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())    
                     elif self.custom["mode"] == "only_b":
                         self._db = self.lora_db[adapter_name].data.clone().to(get_device())
                     elif self.custom["mode"] == "only_d":
@@ -997,6 +1116,7 @@ class Linear(nn.Linear, LoraLayer):
         in_features: int,
         out_features: int,
         r: int = 0,
+        lora_c: int = 1,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
@@ -1017,7 +1137,7 @@ class Linear(nn.Linear, LoraLayer):
             self.weight.data = self.weight.data.T
 
         nn.Linear.reset_parameters(self)
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer(adapter_name, r, lora_c, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
     def merge(self):
@@ -1114,6 +1234,37 @@ class Linear(nn.Linear, LoraLayer):
                     _x2 = x @ self._A.T
                     _x2 = _x2 @ self._B.T
                     result -= _x2 * self.scaling[self.active_adapter]
+
+            elif self.custom["mode"] == "sara":
+                B, S, C = x.shape
+
+                num_heads = 1
+
+                # Project through LoRA
+                lora_out = self.lora_A[self.active_adapter](x)
+
+                # Attention projections
+                qkv = self.lora_attn_Wqkv[self.active_adapter](lora_out).reshape(B, S, 3, num_heads, C // self.lora_c[self.active_adapter])
+                q, k, v = qkv.transpose(3, 1).unbind(dim=2)
+
+                # Attention scores        
+                attn = q @ k.transpose(-2, -1)
+                attn = attn / math.sqrt(k.size(-1))
+                attn = attn.softmax(dim=-1)
+
+                # Attention output
+                attn_output = attn @ v
+                attn_output = attn_output.transpose(1, 2).reshape(B, S, C // self.lora_c[self.active_adapter])
+                attn_output = self.lora_attn_Wo[self.active_adapter](attn_output)
+
+                # Final projection and scaling
+                up_project_out = self.lora_B[self.active_adapter](attn_output)
+                output = up_project_out * self.lora_db[self.active_adapter]
+                output = output * self.scaling[self.active_adapter] 
+
+                result += output
+
+
             elif self.custom["mode"] == "elora":
                 result += self.lora_db[self.active_adapter] * self.lora_B[self.active_adapter](
                     d_after * self.lora_A[self.active_adapter](x)
@@ -1537,4 +1688,4 @@ if is_bnb_available():
                                 raise NotImplementedError()
                         else:
                             raise NotImplementedError()
-                return result
+                return result            

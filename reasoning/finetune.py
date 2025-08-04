@@ -14,8 +14,11 @@ from transformers import (
     BitsAndBytesConfig,
 )
 import argparse
+sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+print("Current Python path:", sys.path)
+print("Contents of peft/src:", os.listdir(os.path.join(os.getcwd(), "peft/src")))
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from peft.tuners.sara import LoraLayer
+from peft.tuners.lora import LoraLayer
 from utils import (
     load_data,
     format_dataset,
@@ -55,7 +58,7 @@ def run(args):
     print(f"Job ID: {job_id}")
     print(f"Output directory: {output_dir}")
 
-    imdb = load_dataset("imdb")
+    #imdb = load_dataset("imdb")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, padding_side="right", use_fast=False, legacy=True
@@ -112,20 +115,20 @@ def run(args):
             ["[Review is negative.]", "[Review is positive.]"],
         )
 
-    eval_ds = {}
-    ds_names = ["easy", "quotes", "brackets"]
-    for name in ds_names:
-        eval_ds[name] = (
-            imdb["test"]
-            if (args.eval_samples is None or args.eval_samples == 0)
-            else get_subset(imdb["test"], args.eval_samples)
-        )
-        eval_ds[name] = eval_ds[name].map(
-            eval(f"imdb_to_alpaca_{name}"),
-            batched=True,
-            remove_columns=imdb["train"].column_names,
-        )
-        eval_ds[name] = format_dataset(eval_ds[name], "alpaca-clean")
+#    eval_ds = {}
+#    ds_names = ["easy", "quotes", "brackets"]
+#    for name in ds_names:
+#        eval_ds[name] = (
+#            imdb["test"]
+#            if (args.eval_samples is None or args.eval_samples == 0)
+#            else get_subset(imdb["test"], args.eval_samples)
+#        )
+#        eval_ds[name] = eval_ds[name].map(
+#            eval(f"imdb_to_alpaca_{name}"),
+#            batched=True,
+#            remove_columns=imdb["train"].column_names,
+#        )
+#        eval_ds[name] = format_dataset(eval_ds[name], "alpaca-clean")
 
     if args.task == "instruct":
         dataset = load_data(args.dataset)
@@ -351,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_modules", type=str, default="lm_head")
 
     parser.add_argument(
-        "--task", type=str, default="instruct", choices=["instruct", "imdb"]
+        "--task", type=str, default="instruct", choices=["instruct", "imdb", "math"]
     )
     parser.add_argument("--dataset", type=str, default="alpaca-clean")
     parser.add_argument("--dataset_format", type=str, default="alpaca-clean")
