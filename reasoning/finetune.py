@@ -15,7 +15,7 @@ from transformers import (
 )
 import argparse
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from peft.src.peft.tuners.sara import LoraLayer
+from peft.tuners.sara import LoraLayer
 from utils import (
     load_data,
     format_dataset,
@@ -129,12 +129,23 @@ def run(args):
 
     if args.task == "instruct":
         dataset = load_data(args.dataset)
-        dataset = format_dataset(dataset, args.dataset)
+        dataset = format_dataset(dataset, args.dataset_format)
         train_ds = (
             dataset["train"]
             if (args.train_samples is None or args.train_samples == 0)
             else dataset["train"].select(range(args.train_samples))
         )
+
+    elif args.task == "math":
+        dataset = load_data(args.dataset)
+        dataset = format_dataset(dataset, args.dataset_format)
+        val_set_size = 120
+        train_val = dataset["train"].train_test_split(
+            test_size=val_set_size, shuffle=True, seed=42
+        )
+        train_ds = train_val["train"].shuffle()
+        eval_ds =  train_val["test"].shuffle()
+
     elif args.task == "imdb":
         name = args.dataset
         train_ds = (
@@ -343,6 +354,7 @@ if __name__ == "__main__":
         "--task", type=str, default="instruct", choices=["instruct", "imdb"]
     )
     parser.add_argument("--dataset", type=str, default="alpaca-clean")
+    parser.add_argument("--dataset_format", type=str, default="alpaca-clean")
     parser.add_argument("--train_samples", type=int, default=None)
     parser.add_argument("--metric_samples", type=int, default=100)
     parser.add_argument("--eval_samples", type=int, default=None)
