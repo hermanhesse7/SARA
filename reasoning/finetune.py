@@ -14,11 +14,10 @@ from transformers import (
     BitsAndBytesConfig,
 )
 import argparse
+
 sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
-print("Current Python path:", sys.path)
-print("Contents of peft/src:", os.listdir(os.path.join(os.getcwd(), "peft/src")))
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from peft.tuners.lora import LoraLayer
+from peft import get_peft_model, prepare_model_for_kbit_training
+from peft.tuners.lora import LoraLayer, LoraConfig
 from utils import (
     load_data,
     format_dataset,
@@ -42,7 +41,31 @@ def log_metrics_to_csv(metrics, filename, fieldnames=None):
             writer.writeheader()
         writer.writerow(metrics)
 
+
+
+def validate_args(args):
+    """Validate argument combinations"""
+    if args.custom_mode == "sara":
+        if args.lora_c <= 0:
+            raise ValueError("SARA mode requires lora_c > 0")
+        if args.lora_r % args.lora_c != 0:
+            raise ValueError(f"For SARA mode, lora_r ({args.lora_r}) must be divisible by lora_c ({args.lora_c})")
+    
+    if args.shared_uv == 1 and args.shared_dim is None:
+        raise ValueError("shared_uv=1 requires shared_dim to be specified")
+    
+    if args.custom_mode == "full" and any([
+        args.lora_r != 16,  # Default values suggest LoRA usage
+        args.lora_alpha != 1,
+        args.target_modules != "lm_head"
+    ]):
+        print("Warning: LoRA parameters specified but custom_mode is 'full'")
+
+# Add validation call        
+
 def run(args):
+    validate_args(args)
+
     job_id = os.environ.get("SLURM_JOB_ID", "0")
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir
@@ -168,7 +191,6 @@ def run(args):
     if args.quantize:
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            load_in_4bit=True,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             quantization_config=BitsAndBytesConfig(
@@ -198,6 +220,7 @@ def run(args):
         config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
+            lora_c=args.lora_c,
             lora_dropout=0.00,
             target_modules=target_modules,
             bias="none",
@@ -205,9 +228,9 @@ def run(args):
         )
         config.custom = {
             "mode": args.custom_mode,
-            "submode": None,
-            "d_init": 1.0,
-            "sqrt_a": 5.0,
+            "submode": args.custom_submode,  
+            "d_init": args.custom_d_init, 
+            "sqrt_a": args.custom_sqrt_a,
             "identity": not args.custom_disable_identity,
             "init_type": args.init_type,
             "d_init_type": args.d_init_type,
@@ -225,8 +248,20 @@ def run(args):
             "norm_penalty": 0,
             "norm_alpha": 0.0,
         }
-        model = get_peft_model(model, config)
+            
+        print("="*50)
+        print("LoRA Configuration:")
+        print(f"Mode: {config.custom['mode']}")
+        print(f"r: {config.r}")
+        print(f"alpha: {config.lora_alpha}")
+        if hasattr(config, 'lora_c'):
+            print(f"c: {config.lora_c}")
+        print(f"Target modules: {target_modules}")
+        print(f"Custom config: {config.custom}")
+        print("="*50)
 
+        model = get_peft_model(model, config)
+        print("model:",model)
         if args.quantize:
             for name, module in model.named_modules():
                 if isinstance(module, LoraLayer):
@@ -248,11 +283,10 @@ def run(args):
         dataloader_num_workers=4,
         num_train_epochs=args.epochs,
         weight_decay=args.wd,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         save_strategy="no",
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
-        report_to="csv",  # Enable built-in CSV logging
         gradient_accumulation_steps=args.accumulation_steps,
         bf16=args.quantize,
         warmup_ratio=args.warmup_ratio,
@@ -323,6 +357,15 @@ def run(args):
 
 
 if __name__ == "__main__":
+
+    def shared_dim_type(value):
+        if value.lower() == 'none':
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("shared_dim must be an integer or 'none'")
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--custom_mode",
@@ -339,7 +382,7 @@ if __name__ == "__main__":
         help="submode of finetuning",
     )
     parser.add_argument("--custom_scaling", type=int, default=0)
-    parser.add_argument("--shared_dim", type=int, default=0)
+    parser.add_argument("--shared_dim", type=shared_dim_type, default="none", help="Shared dimension size (integer) or 'none'")
     parser.add_argument("--shared_uv", type=int, default=0)
     parser.add_argument("--dynamic_uv", type=int, default=0)
     parser.add_argument("--custom_d_init", type=float, default=1.0)
@@ -371,7 +414,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", type=str, default="gpt2")
-    parser.add_argument("--quantize", action="store_true")
+    parser.add_argument("--quantize", type=bool, default = False)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--wd", type=float, default=0.0)
     parser.add_argument("--accumulation_steps", type=int, default=1)

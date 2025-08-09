@@ -66,7 +66,7 @@ class LoraConfig(PeftConfig):
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
 
-    lora_c: int = field(default=4, metadeta={"help": "Determine head dimension in sara method"})
+    lora_c: int = field(default=4, metadata={"help": "Determine head dimension in sara method"})
 
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
@@ -561,57 +561,155 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
 
 
 class LoraLayer:
-    def __init__(self, in_features: int, out_features: int, fan_in_fan_out: bool, custom, **kwargs):
-        self.r = {}
-        self.lora_alpha = {}
-        self.lora_c = {}
-        self.scaling = {}
-        self.lora_dropout = nn.ModuleDict({})
-
-        self.lora_A = nn.ModuleDict({})
-        self.lora_B = nn.ModuleDict({})
-
-        # For Embedding layer
-        self.lora_embedding_A = nn.ParameterDict({})
-        self.lora_embedding_B = nn.ParameterDict({})
-        # Mark the weight as unmerged
-        self.merged = False
-        self.disable_adapters = False
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        fan_in_fan_out: bool,
+        custom: dict,
+        **kwargs,
+    ):
+        # core attributes
         self.in_features = in_features
         self.out_features = out_features
-        self.kwargs = kwargs
+        self.merged = False
+        self.disable_adapters = False
         self.fan_in_fan_out = fan_in_fan_out
         self.custom = custom
+        self.kwargs = kwargs
 
-        if self.custom["mode"] == "elora":
-            self.lora_d = nn.ParameterDict({})
-            self.lora_db = nn.ParameterDict({})
+        # adapter storage
+        self.r = {}
+        self.lora_c = {}
+        self.lora_alpha = {}
+        self.scaling = {}
+        self.lora_dropout = nn.ModuleDict()
+        self.lora_A = nn.ModuleDict()
+        self.lora_B = nn.ModuleDict()
+        self.lora_embedding_A = nn.ParameterDict()
+        self.lora_embedding_B = nn.ParameterDict()
 
-        elif self.custom["mode"] == "sara":
-            self.lora_attn_Wqkv = nn.ModuleDict({})
-            self.lora_attn_Wo = nn.ModuleDict({})
-            self.lora_db = nn.ParameterDict({})           
-        
+        # additional mode-specific storage
+        if custom.get("mode") == "elora":
+            self.lora_d = nn.ParameterDict()
+            self.lora_db = nn.ParameterDict()
+        elif custom.get("mode") == "sara":
+            self.lora_attn_Wqkv = nn.ModuleDict()
+            self.lora_attn_Wo = nn.ModuleDict()
+            self.lora_db = nn.ParameterDict()
 
     @staticmethod
     def _kaiming_init(tensor: torch.Tensor):
+        # manual Kaiming uniform initialization
         fan = nn.init._calculate_correct_fan(tensor, mode="fan_in")
         gain = math.sqrt(2.0)
         std = gain / math.sqrt(fan)
         bound = math.sqrt(3.0) * std
         with torch.no_grad():
-            return tensor.uniform_(-bound, bound)
-        
+            tensor.uniform_(-bound, bound)
 
-    @property
-    def merged(self) -> bool:
-        return bool(self.merged_adapters)
+    def _init_A_B(self, adapter_name: str):
+        sqrt_a = self.custom["sqrt_a"]
+        t = self.custom.get("init_type", 0)
+        A = self.lora_A[adapter_name].weight
+        B = self.lora_B[adapter_name].weight
 
-    def update_layer(self, adapter_name, r, lora_c, lora_alpha, lora_dropout, init_lora_weights):
+        # mapping of init types to actions
+        if t == 0:
+            nn.init.kaiming_uniform_(A, a=math.sqrt(sqrt_a))
+            nn.init.kaiming_uniform_(B, a=math.sqrt(sqrt_a))
+        elif t == 1:
+            nn.init.kaiming_uniform_(A)
+            nn.init.kaiming_uniform_(B)
+        elif t == 2:
+            nn.init.xavier_uniform_(A)
+            nn.init.xavier_uniform_(B)
+        elif t == 3:
+            nn.init.kaiming_normal_(A)
+            nn.init.kaiming_normal_(B)
+        elif t == 4:
+            nn.init.xavier_normal_(A)
+            nn.init.xavier_normal_(B)
+        elif t == 5:
+            nn.init.trunc_normal_(A, std=0.02, a=-1.0, b=1.0)
+            nn.init.trunc_normal_(B, std=0.02, a=-1.0, b=1.0)
+        elif t == 6:
+            nn.init.uniform_(A, a=0.0, b=0.1)
+            nn.init.uniform_(B, a=0.0, b=0.1)
+        elif t == 7:
+            self._kaiming_init(A)
+            self._kaiming_init(B)
+        elif t == 10:
+            nn.init.normal_(A)
+            nn.init.normal_(B)
+            A.data *= self.scaling[adapter_name]
+        else:
+            raise NotImplementedError(f"Unknown init_type {t}")
+
+    def _apply_svd(self, adapter_name: str):
+        # low-rank SVD boost
+        r = self.r[adapter_name]
+        U, s, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
+        U = torch.mm(U, torch.diag(s))
+        self.lora_A[adapter_name].weight.data = V.T[: r, :]
+        self.lora_B[adapter_name].weight.data = U[:, : r]
+
+    def _get_d_init_fn(self, init_type: int):
+        # generate a factory for d-initializers
+        use64 = self.custom.get("use_float64", False)
+        dtype = torch.float64 if use64 else torch.float32
+
+        def normal(dim, scale=1.0):
+            return torch.randn(dim, dtype=dtype) * scale
+        def ones(dim):
+            return torch.ones(dim, dtype=dtype)
+        def zeros(dim):
+            return torch.zeros(dim, dtype=dtype)
+        def constant(val):
+            return lambda dim: torch.full(dim if isinstance(dim, tuple) else (dim,), val, dtype=dtype)
+
+        mapping = {
+            0: lambda dim: normal(dim, scale=self.custom.get("d_init", 1.0)),
+            1: ones,
+            2: lambda dim: normal(dim, scale=1/10) + 1,
+            3: lambda dim: normal(dim, scale=1/100) + 1,
+            4: constant(1e-7),
+            91: lambda dim, comp="d": zeros(dim) if comp=="d" else ones(dim),
+            92: lambda dim, comp="d": ones(dim) if comp=="d" else zeros(dim),
+            93: lambda dim, comp="d": (ones(dim) if comp=="b" else constant(1e-7)(dim)),
+            94: lambda dim, comp="d": (constant(0.1)(dim) if comp=="d" else zeros(dim)),
+            95: lambda dim, comp="d": (constant(0.001)(dim) if comp=="d" else zeros(dim)),
+            96: lambda dim, comp="d": (constant(0.5)(dim) if comp=="d" else zeros(dim)),
+            97: lambda dim, comp="d": (constant(0.01)(dim) if comp=="d" else zeros(dim)),
+            98: lambda dim, comp="d": (zeros(dim) if comp=="b" else constant(1e-7)(dim)),
+            990: lambda dim, comp="d": (normal(dim) if comp=="d" else zeros(dim)),
+            991: lambda dim, comp="d": (nn.init.trunc_normal_(torch.zeros(dim, dtype=dtype), a=-1.0, b=1.0) if comp=="d" else zeros(dim)),
+            100: lambda dim, comp="b": zeros(dim),
+            101: lambda dim, comp="b": constant(1e-3)(dim),
+            102: lambda dim, comp="b": constant(1e-7)(dim),
+            103: lambda dim, comp="b": ones(dim),
+        }
+        fn = mapping.get(init_type)
+        if fn is None:
+            raise NotImplementedError(f"d_init_type {init_type} not supported")
+        return fn
+
+    def update_layer(
+        self,
+        adapter_name: str,
+        r: int,
+        lora_c: int,
+        lora_alpha: float,
+        lora_dropout: float,
+        init_lora_weights: bool = True,
+    ):
+        # register configs
         self.r[adapter_name] = r
-        self.lora_c[adapter_name] = lora_c 
         self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         self.lora_alpha[adapter_name] = lora_alpha
+        self.lora_c[adapter_name] = lora_c
+
+        # dropout
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
         else:
@@ -619,7 +717,7 @@ class LoraLayer:
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
 
-        # Actual trainable parameters
+        # build A/B
         if r > 0:
             if self.custom["shared_dim"] is None:
                 _lora_A = nn.Linear(
@@ -667,281 +765,52 @@ class LoraLayer:
                     )
                     _lora_A.weight.data = self.custom["shared_matrices"]["A"].weight.data[:r, : self.in_features]
                     _lora_B.weight.data = self.custom["shared_matrices"]["B"].weight.data[: self.out_features, :r]
-
             self.lora_A.update(nn.ModuleDict({adapter_name: _lora_A}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))
+            self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))            
 
-            if self.custom["mode"] == "sara":
-                assert lora_c > 0, "lora_c must be positive"
-                assert r % lora_c == 0, "r must be divisible by lora_c"
+            # SARA attention if needed
+            if self.custom.get("mode")=="sara":
+                if lora_c <= 0 or r % lora_c != 0:
+                    raise ValueError(f"For SARA mode, lora_c must be positive and divide r evenly. Got r={r}, lora_c={lora_c}")
+    
+                head_dim = r//lora_c
+                self.lora_attn_Wqkv[adapter_name] = nn.Linear(r, head_dim*3, bias=False)
+                self.lora_attn_Wo[adapter_name]   = nn.Linear(head_dim, r, bias=False)
 
-                head_dim = (r // lora_c)
-
-                lora_attention_Wqkv = nn.Linear(r, head_dim * 3, bias=False)
-                lora_attention_Wo = nn.Linear(head_dim, r, bias=False)
-
-                self.lora_attn_Wqkv.update(nn.ModuleDict({adapter_name: lora_attention_Wqkv}))
-                self.lora_attn_Wo.update(nn.ModuleDict({adapter_name: lora_attention_Wo}))
-
-
-            if self.custom["mode"] != "lora":
-
-                if not self.custom["trainable_uv"]:
-
-                    self.lora_A.requires_grad_(False)
-                    self.lora_B.requires_grad_(False)
-
-                if self.custom["d_init_type"] == 0:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            * self.custom["d_init"]
-                        )
-
-                elif self.custom["d_init_type"] == 1:
-
-                    def d_init_fn(dim, component="d"):
-                        return torch.ones(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-
-                elif self.custom["d_init_type"] == 2:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            / 10.0
-                            + 1
-                        )
-
-                elif self.custom["d_init_type"] == 3:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            / 100.0
-                            + 1
-                        )
-
-                elif self.custom["d_init_type"] == 4:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        return torch.full(
-                            dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                        )
-
-                elif self.custom["d_init_type"] == 91:
-
-                    def d_init_fn(dim, component="d"):
-                        if component == "d":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 92:
-
-                    def d_init_fn(dim, component="d"):
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 93:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 94:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 0.1, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 95:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.001, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 96:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.5, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 97:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.01, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 98:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 990:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.randn(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 991:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            _d = torch.zeros(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            torch.nn.init.trunc_normal_(_d, a=-1.0, b=1.0)
-                            return _d
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        
-                elif self.custom["d_init_type"] == 100:
-                    def d_init_fn(dim, component="b"):
-                        if isinstance(dim, int):
-                            dim = (dim,)    
-                        return torch.zeros(
-                            dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                        )
-
-                elif self.custom["d_init_type"] == 101:
-                    def d_init_fn(dim, component="b"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        return torch.full(
-                            dim, 1e-3, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                        )
-                    
-                elif self.custom["d_init_type"] == 102:
-                    def d_init_fn(dim, component="b"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        return torch.full(
-                            dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                        )
-
-                elif self.custom["d_init_type"] == 103:
-                    def d_init_fn(dim, component="b"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        return torch.ones(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-
-                else:
-                    raise NotImplementedError()
-
-
-                if self.custom["shared_d"]:
-                    if self.custom["shared_d_vector"] is None:
-                        _lora_d = nn.Parameter(d_init_fn(r, "d"))
-                        self.custom["shared_d_vector"] = _lora_d
-                    else:
-                        _lora_d = self.custom["shared_d_vector"]
-                else:
-                    _lora_d = nn.Parameter(d_init_fn(r, "d"))
-
-                if self.custom["mode"] == "sara":
-
-                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))                    
-                    self.lora_db.requires_grad_(True)
-
-
-                elif self.custom["mode"] == "elora":
-
-                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))                    
-                    self.lora_db.requires_grad_(True)
-                    self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
-                    self.lora_d.requires_grad_(True)
-
-                elif self.custom["mode"] == "only_b":
-
-                    self.lora_db.update(nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))}))
-                    self.lora_db.requires_grad_(True)
-
-                elif self.custom["mode"] == "only_d":
-
-                    self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
-                    self.lora_d.requires_grad_(True)
-
-            if self.custom["submode"] == "lora_half" or self.custom["submode"] == "lora_half_svd":
-
+            # parameter freezing
+            if self.custom.get("mode")!="lora" and not self.custom.get("trainable_uv",False):
                 self.lora_A.requires_grad_(False)
+                self.lora_B.requires_grad_(False)
 
+            # d and b initializations
+            init_type = self.custom.get("d_init_type", 0)
+            d_fn = self._get_d_init_fn(init_type)
+            shared = self.custom.get("shared_d", False)
+
+            # create d-vector
+            if shared:
+                if getattr(self.custom, "shared_d_vector", None) is None:
+                    shared_vec = nn.Parameter(d_fn((r,), ))
+                    self.custom["shared_d_vector"] = shared_vec
+                lora_d = self.custom["shared_d_vector"]
+            else:
+                lora_d = nn.Parameter(d_fn((r,), ))
+
+            # assign based on mode
+            mode = self.custom.get("mode")
+            if mode in {"sara","elora","only_b"}:
+                self.lora_db[adapter_name] = nn.Parameter(d_fn((self.out_features,), ))
+                self.lora_db.requires_grad_(True)
+            if mode in {"elora","only_d"}:
+                self.lora_d[adapter_name]  = nn.Parameter(lora_d)
+                self.lora_d.requires_grad_(True)
+
+        # init weights if desired
         if init_lora_weights:
-
             self.reset_lora_parameters(adapter_name)
 
         self.to(self.weight.device)
+
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         raise NotImplementedError()
@@ -993,119 +862,59 @@ class LoraLayer:
         self.to(self.weight.device)
 
     def reset_lora_parameters(self, adapter_name):
-        if adapter_name in self.lora_A.keys():
-            sqrt_a = self.custom["sqrt_a"]
-            if self.custom["mode"] == "lora":
-                if self.custom["submode"] == "lora_half_svd" or self.custom["submode"] == "lora_svd":
-                    U, s, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
-                    U = torch.mm(U, torch.diag(s))
-                    self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
-                    self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
-                else:
-                    nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
-                    nn.init.zeros_(self.lora_B[adapter_name].weight)
+        if adapter_name not in self.lora_A:
+            return
 
-                if self.custom["identity"]:
-                    self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
-                    self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
+        sqrt_a = self.custom["sqrt_a"]
+        mode = self.custom["mode"]
+        submode = self.custom.get("submode", "")
+        init_type = self.custom.get("init_type", 0)
+        r = self.r[adapter_name]
+
+        # --- Initialization logic ---
+        if mode == "lora":
+            if submode in {"lora_half_svd", "lora_svd"}:
+                self._apply_svd(adapter_name)
             else:
+                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
+                nn.init.zeros_(self.lora_B[adapter_name].weight)
 
-                if self.custom["mode"] == "sara":
-                        if self.custom["submode"] == "lora_half_svd" or self.custom["submode"] == "lora_svd":
-                            U, s, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
-                            U = torch.mm(U, torch.diag(s))
-                            self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
-                            self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
+        elif mode == "sara":
+            if submode in {"lora_half_svd", "lora_svd"}:
+                self._apply_svd(adapter_name)
+            else:
+                self._init_A_B(adapter_name)
 
-                        else:
-                            if self.custom["init_type"] == 0:
-                                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
-                                nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(sqrt_a))
-                            elif self.custom["init_type"] == 1:
-                                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight)
-                                nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight)
-                            elif self.custom["init_type"] == 2:
-                                nn.init.xavier_uniform_(self.lora_A[adapter_name].weight)
-                                nn.init.xavier_uniform_(self.lora_B[adapter_name].weight)
-                            elif self.custom["init_type"] == 3:
-                                nn.init.kaiming_normal_(self.lora_A[adapter_name].weight)
-                                nn.init.kaiming_normal_(self.lora_B[adapter_name].weight)
-                            elif self.custom["init_type"] == 4:
-                                nn.init.xavier_normal_(self.lora_A[adapter_name].weight)
-                                nn.init.xavier_normal_(self.lora_B[adapter_name].weight)
-                            elif self.custom["init_type"] == 5:
-                                nn.init.trunc_normal_(self.lora_A[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                                nn.init.trunc_normal_(self.lora_B[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                            elif self.custom["init_type"] == 6:
-                                nn.init.uniform_(self.lora_A[adapter_name].weight, a=0.0, b=0.1)
-                                nn.init.uniform_(self.lora_B[adapter_name].weight, a=0.0, b=0.1)
-                            elif self.custom["init_type"] == 7:
-                                self._kaiming_init(self.lora_A[adapter_name].weight)
-                                self._kaiming_init(self.lora_B[adapter_name].weight)  
-                            elif self.custom["init_type"] == 10:
-                                nn.init.normal_(self.lora_A[adapter_name].weight)
-                                nn.init.normal_(self.lora_B[adapter_name].weight)
-                                self.lora_A[adapter_name].weight.data *= self.scaling[adapter_name]
+        elif mode in {"only_d", "only_b", "elora"}:
+            self._init_A_B(adapter_name)
 
+        elif mode == "svd":
+            W = self.weight.T if self.fan_in_fan_out else self.weight
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            self.lora_A[adapter_name].weight.data = Vh[:r, :]
+            self.lora_B[adapter_name].weight.data = U[:, :r]
+            self.lora_d[adapter_name].data = S[:r]
 
-                if (
-                    self.custom["mode"] == "only_d"
-                    or self.custom["mode"] == "elora"
-                    or self.custom["mode"] == "only_b"
-                ):
-                    if self.custom["init_type"] == 0:
-                        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
-                        nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(sqrt_a))
-                    elif self.custom["init_type"] == 1:
-                        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight)
-                        nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 2:
-                        nn.init.xavier_uniform_(self.lora_A[adapter_name].weight)
-                        nn.init.xavier_uniform_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 3:
-                        nn.init.kaiming_normal_(self.lora_A[adapter_name].weight)
-                        nn.init.kaiming_normal_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 4:
-                        nn.init.xavier_normal_(self.lora_A[adapter_name].weight)
-                        nn.init.xavier_normal_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 5:
-                        nn.init.trunc_normal_(self.lora_A[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                        nn.init.trunc_normal_(self.lora_B[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                    elif self.custom["init_type"] == 6:
-                        nn.init.uniform_(self.lora_A[adapter_name].weight, a=0.0, b=0.1)
-                        nn.init.uniform_(self.lora_B[adapter_name].weight, a=0.0, b=0.1)
-                    elif self.custom["init_type"] == 7:
-                        self._kaiming_init(self.lora_A[adapter_name].weight)
-                        self._kaiming_init(self.lora_B[adapter_name].weight)  
-                    elif self.custom["init_type"] == 10:
-                        nn.init.normal_(self.lora_A[adapter_name].weight)
-                        nn.init.normal_(self.lora_B[adapter_name].weight)
-                        self.lora_A[adapter_name].weight.data *= self.scaling[adapter_name]
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
 
-                if self.custom["mode"] == "svd":
-                    U, S, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
-                    self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
-                    self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
-                    self.lora_d[adapter_name].data = S.data[: self.r[adapter_name]]
+        # --- Identity snapshots ---
+        if self.custom.get("identity", False):
+            self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
+            self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
+            if mode in {"elora", "sara", "only_b"}:
+                self._db = self.lora_db[adapter_name].data.clone().to(get_device())
+            if mode in {"elora", "only_d", "svd"}:
+                self._d = self.lora_d[adapter_name].data.clone().to(get_device())
 
-                if self.custom["identity"]:
-                    self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
-                    self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
-                    if self.custom["mode"] == "elora":
-                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())
-                        self._d = self.lora_d[adapter_name].data.clone().to(get_device())
-                    elif self.custom["mode"] == "sara":
-                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())    
-                    elif self.custom["mode"] == "only_b":
-                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())
-                    elif self.custom["mode"] == "only_d":
-                        self._d = self.lora_d[adapter_name].data.clone().to(get_device())
+        # --- Optional: lora_embedding ---
+        if adapter_name in self.lora_embedding_A:
+            # If you implement embedding adapters later
+            raise NotImplementedError("lora_embedding adapters are not yet supported.")
+            # Example if implemented:
+            # nn.init.zeros_(self.lora_embedding_A[adapter_name])
+            # nn.init.normal_(self.lora_embedding_B[adapter_name])
 
-        if adapter_name in self.lora_embedding_A.keys():
-            raise NotImplementedError()
-            # initialize a the same way as the default for nn.linear and b to zero
-            nn.init.zeros_(self.lora_embedding_A[adapter_name])
-            nn.init.normal_(self.lora_embedding_B[adapter_name])
 
 
 class Linear(nn.Linear, LoraLayer):

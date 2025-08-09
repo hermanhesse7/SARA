@@ -3,13 +3,13 @@ python finetune.py \
     --eval_samples 64 \
     --custom_mode sara \
     --lr 4e-3 \
-    --lora_r 256 \
+    --lora_r 64 \
+    --lora_c 4 \
     --train_bs 4 \
     --eval_bs 4 \
     --custom_disable_identity \
     --accumulation_steps 4 \
-    --model meta-llama/Llama-2-7b-hf \
-    --quantize \
+    --model Qwen/Qwen3-1.7B-Base \
     --seed 42 \
     --eval_steps 20 \
     --logging_steps 1 \
@@ -22,6 +22,6 @@ python finetune.py \
     --init_type 1 \
     --d_init_type 100 \
     --epochs 1 \
-    --dynamic_uv 1 \
-    --shared_dim 11008 \
-    --shared_uv 1
+    --dynamic_uv 0 \
+    --shared_dim none \
+    --shared_uv 0

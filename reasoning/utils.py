@@ -358,7 +358,7 @@ def load_data(dataset_name):
     elif dataset_name == "alpaca-clean":
         return load_dataset("yahma/alpaca-cleaned")
     elif dataset_name == "gsm10k":
-        return load_dataset("ft-training_set/math_10k.json")
+        return load_dataset("json", data_files="./ft-training_set/math_10k.json")
     elif dataset_name == "chip2":
         return load_dataset("laion/OIG", data_files="unified_chip2.jsonl")
     elif dataset_name == "self-instruct":
