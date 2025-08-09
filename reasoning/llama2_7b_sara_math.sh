@@ -3,7 +3,7 @@ python finetune.py \
     --eval_samples 64 \
     --custom_mode sara \
     --lr 4e-3 \
-    --lora_r 64 \
+    --lora_r 64 \   
     --lora_c 4 \
     --train_bs 4 \
     --eval_bs 4 \
