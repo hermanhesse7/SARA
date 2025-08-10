@@ -775,7 +775,10 @@ class LoraLayer:
     
                 head_dim = r//lora_c
                 self.lora_attn_Wqkv[adapter_name] = nn.Linear(r, head_dim*3, bias=False)
+                self.lora_attn_Wqkv.requires_grad_(True)
                 self.lora_attn_Wo[adapter_name]   = nn.Linear(head_dim, r, bias=False)
+                self.lora_attn_Wo.requires_grad_(True)
+
 
             # parameter freezing
             if self.custom.get("mode")!="lora" and not self.custom.get("trainable_uv",False):
@@ -999,39 +1002,40 @@ class Linear(nn.Linear, LoraLayer):
 
             _scaling = self.scaling[self.active_adapter] if self.custom["custom_scaling"] else 1.0
 
-            if self.active_adapter in self.lora_d.keys():
-                if self.custom["nonlin"] == 0:
-                    d_after = self.lora_d[self.active_adapter]
-                    if hasattr(self, "_d"):
-                        _d_after = self._d
-                elif self.custom["nonlin"] == 1:
-                    d_after = torch.relu(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.relu(self._d)
-                elif self.custom["nonlin"] == 2:
-                    d_after = torch.abs(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.abs(self._d)
-                elif self.custom["nonlin"] == 3:
-                    f = torch.nn.Softplus()
-                    d_after = f(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = f(self._d)
-                elif self.custom["nonlin"] == 4:
-                    f = torch.nn.GELU()
-                    d_after = f(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = f(self._d)
-                elif self.custom["nonlin"] == 5:
-                    d_after = torch.tanh(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.tanh(self._d)
-                elif self.custom["nonlin"] == 6:
-                    d_after = torch.sigmoid(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.sigmoid(self._d)
-                else:
-                    raise NotImplementedError()
+            if self.custom["mode"] in {"elora", "only_d"}:
+                if self.active_adapter in self.lora_d.keys():
+                    if self.custom["nonlin"] == 0:
+                        d_after = self.lora_d[self.active_adapter]
+                        if hasattr(self, "_d"):
+                            _d_after = self._d
+                    elif self.custom["nonlin"] == 1:
+                        d_after = torch.relu(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = torch.relu(self._d)
+                    elif self.custom["nonlin"] == 2:
+                        d_after = torch.abs(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = torch.abs(self._d)
+                    elif self.custom["nonlin"] == 3:
+                        f = torch.nn.Softplus()
+                        d_after = f(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = f(self._d)
+                    elif self.custom["nonlin"] == 4:
+                        f = torch.nn.GELU()
+                        d_after = f(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = f(self._d)
+                    elif self.custom["nonlin"] == 5:
+                        d_after = torch.tanh(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = torch.tanh(self._d)
+                    elif self.custom["nonlin"] == 6:
+                        d_after = torch.sigmoid(self.lora_d[self.active_adapter])
+                        if hasattr(self, "_d"):
+                            _d_after = torch.sigmoid(self._d)
+                    else:
+                        raise NotImplementedError()
 
             if self.custom["mode"] == "lora":
                 result += (
@@ -1045,13 +1049,14 @@ class Linear(nn.Linear, LoraLayer):
                     result -= _x2 * self.scaling[self.active_adapter]
 
             elif self.custom["mode"] == "sara":
-                B, S, C = x.shape
 
                 num_heads = 1
 
                 # Project through LoRA
                 lora_out = self.lora_A[self.active_adapter](x)
 
+                B, S, C = lora_out.shape
+                
                 # Attention projections
                 qkv = self.lora_attn_Wqkv[self.active_adapter](lora_out).reshape(B, S, 3, num_heads, C // self.lora_c[self.active_adapter])
                 q, k, v = qkv.transpose(3, 1).unbind(dim=2)

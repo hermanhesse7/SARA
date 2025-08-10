@@ -35,3 +35,11 @@ job_id,timestamp,custom_mode,custom_submode,custom_scaling,shared_dim,shared_uv,
 0,20250809_160154,sara,none,0,,0,0,1.0,5,True,1,100,256,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
 0,20250809_160309,elora,none,0,,0,0,1.0,5,True,1,100,256,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
 0,20250809_160438,sara,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250809_182915,sara,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250809_183720,sara,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250809_183851,elora,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250809_184159,lora,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250810_082631,lora,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250810_082655,lora,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250810_082803,sara,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
+0,20250810_083436,sara,none,0,,0,0,1.0,5,True,1,100,64,4,1,no_head,math,gsm10k,alpaca-clean,8000,100,64,1,4,10,4,20,1,0,42,Qwen/Qwen3-1.7B-Base,False,0.004,0.0,4,True,0.1,cosine,training_output
